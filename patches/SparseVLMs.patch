@@ -1,0 +1,453 @@
+diff --git a/llava/eval/model_vqa.py b/llava/eval/model_vqa.py
+index 9387064..12b8d6f 100644
+--- a/llava/eval/model_vqa.py
++++ b/llava/eval/model_vqa.py
+@@ -14,6 +14,7 @@
+ from PIL import Image
+ import math
+ 
++import numpy as np
+ 
+ def split_list(lst, n):
+     """Split a list into n (roughly) equal-sized chunks"""
+@@ -38,6 +39,13 @@ def eval_model(args):
+     answers_file = os.path.expanduser(args.answers_file)
+     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+     ans_file = open(answers_file, "w")
++    retained_tokens = args.retained_tokens
++    
++    weights_matrix = None # Default to a matrix of ones
++    if args.weight_path is not None:
++        print(f"Loading weights matrix from {args.weight_path}")
++        weights_matrix = torch.from_numpy(np.load(args.weight_path)).float().to(device='cuda', non_blocking=True)
++    
+     for line in tqdm(questions):
+         idx = line["question_id"]
+         image_file = line["image"]
+@@ -56,13 +64,24 @@ def eval_model(args):
+         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+ 
+         image = Image.open(os.path.join(args.image_folder, image_file)).convert('RGB')
+-        image_tensor = process_images([image], image_processor, model.config)[0]
++        processed_images, processed_masks = process_images([image], image_processor, model.config)
++        image_tensor = processed_images[0]
++        pad_masks = processed_masks[0]
++
++        weights = weights_matrix
++        if args.rm_padding and pad_masks is not None:
++            if weights_matrix is not None:
++                weights = weights * pad_masks.to(device='cuda', non_blocking=True)
++            else:
++                weights = pad_masks.to(device='cuda', non_blocking=True)
+ 
+         with torch.inference_mode():
+             output_ids = model.generate(
+                 input_ids,
+                 images=image_tensor.unsqueeze(0).half().cuda(),
+                 image_sizes=[image.size],
++                weights=weights,
++                retained_tokens = retained_tokens,
+                 do_sample=True if args.temperature > 0 else False,
+                 temperature=args.temperature,
+                 top_p=args.top_p,
+@@ -96,6 +115,9 @@ def eval_model(args):
+     parser.add_argument("--temperature", type=float, default=0.2)
+     parser.add_argument("--top_p", type=float, default=None)
+     parser.add_argument("--num_beams", type=int, default=1)
++    parser.add_argument("--retained_tokens", type=int, default=192)
++    parser.add_argument("--rm-padding", action="store_true",)
++    parser.add_argument("--weight-path", type=str, default=None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_loader.py b/llava/eval/model_vqa_loader.py
+index 23d3635..7612323 100644
+--- a/llava/eval/model_vqa_loader.py
++++ b/llava/eval/model_vqa_loader.py
+@@ -16,6 +16,7 @@
+ from PIL import Image
+ import math
+ 
++import numpy as np
+ 
+ def split_list(lst, n):
+     """Split a list into n (roughly) equal-sized chunks"""
+@@ -52,21 +53,25 @@ def __getitem__(self, index):
+         prompt = conv.get_prompt()
+ 
+         image = Image.open(os.path.join(self.image_folder, image_file)).convert('RGB')
+-        image_tensor = process_images([image], self.image_processor, self.model_config)[0]
++        processed_images, processed_masks = process_images([image], self.image_processor, self.model_config)
++
++        image_tensor = processed_images[0]
++        pad_mask = processed_masks[0]
+ 
+         input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+ 
+-        return input_ids, image_tensor, image.size
++        return input_ids, image_tensor, image.size, pad_mask
+ 
+     def __len__(self):
+         return len(self.questions)
+ 
+ 
+ def collate_fn(batch):
+-    input_ids, image_tensors, image_sizes = zip(*batch)
++    input_ids, image_tensors, image_sizes, pad_masks = zip(*batch)
+     input_ids = torch.stack(input_ids, dim=0)
+     image_tensors = torch.stack(image_tensors, dim=0)
+-    return input_ids, image_tensors, image_sizes
++    pad_masks = torch.stack(pad_masks, dim=0)
++    return input_ids, image_tensors, image_sizes, pad_masks
+ 
+ 
+ # DataLoader
+@@ -93,19 +98,32 @@ def eval_model(args):
+         args.conv_mode = args.conv_mode + '_mmtag'
+         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
+ 
++    weights_matrix = None # Default to a matrix of ones
++    if args.weight_path is not None:
++        print(f"Loading weights matrix from {args.weight_path}")
++        weights_matrix = torch.from_numpy(np.load(args.weight_path)).float().to(device='cuda', non_blocking=True)
++    
+     data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
+     
+     retained_tokens = args.retained_tokens
+-    for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
++    for (input_ids, image_tensor, image_sizes, pad_masks), line in tqdm(zip(data_loader, questions), total=len(questions)):
+         idx = line["question_id"]
+         cur_prompt = line["text"]
+ 
+         input_ids = input_ids.to(device='cuda', non_blocking=True)
++        weights = weights_matrix
++        if args.rm_padding and pad_masks is not None:
++            if weights_matrix is not None:
++                weights = weights * pad_masks.to(device='cuda', non_blocking=True)
++            else:
++                weights = pad_masks.to(device='cuda', non_blocking=True)
++
+         with torch.inference_mode():
+             output_ids = model.generate(
+                 input_ids,
+                 images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
+                 image_sizes=image_sizes,
++                weights=weights,
+                 retained_tokens = retained_tokens,
+                 do_sample=True if args.temperature > 0 else False,
+                 temperature=args.temperature,
+@@ -140,6 +158,8 @@ def eval_model(args):
+     parser.add_argument("--num_beams", type=int, default=1)
+     parser.add_argument("--max_new_tokens", type=int, default=128)
+     parser.add_argument("--retained_tokens", type=int, default=192)
++    parser.add_argument("--rm-padding", action="store_true",)
++    parser.add_argument("--weight-path", type=str, default=None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_mmbench.py b/llava/eval/model_vqa_mmbench.py
+index 960ca77..7af6b21 100644
+--- a/llava/eval/model_vqa_mmbench.py
++++ b/llava/eval/model_vqa_mmbench.py
+@@ -15,6 +15,7 @@
+ from PIL import Image
+ import math
+ 
++import numpy as np
+ 
+ all_options = ['A', 'B', 'C', 'D']
+ 
+@@ -69,6 +70,11 @@ def eval_model(args):
+         args.conv_mode = args.conv_mode + '_mmtag'
+         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
+ 
++    weights_matrix = None # Default to a matrix of ones
++    if args.weight_path is not None:
++        print(f"Loading weights matrix from {args.weight_path}")
++        weights_matrix = torch.from_numpy(np.load(args.weight_path)).float().to(device='cuda', non_blocking=True)
++    
+     for index, row in tqdm(questions.iterrows(), total=len(questions)):
+         options = get_options(row, all_options)
+         cur_option_char = all_options[:len(options)]
+@@ -106,13 +112,22 @@ def eval_model(args):
+ 
+             input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+ 
+-            image_tensor = process_images([image], image_processor, model.config)[0]
++            processed_images, processed_masks = process_images([image], image_processor, model.config)
++            image_tensor = processed_images[0]
++            pad_masks = processed_masks[0]
++            weights = weights_matrix
++            if args.rm_padding and pad_masks is not None:
++                if weights_matrix is not None:
++                    weights = weights * pad_masks.to(device='cuda', non_blocking=True)
++                else:
++                    weights = pad_masks.to(device='cuda', non_blocking=True)
+ 
+             with torch.inference_mode():
+                 output_ids = model.generate(
+                     input_ids,
+                     images=image_tensor.unsqueeze(0).half().cuda(),
+                     image_sizes=[image.size],
++                    weights=weights,
+                     retained_tokens = retained_tokens,
+                     do_sample=True if args.temperature > 0 else False,
+                     temperature=args.temperature,
+@@ -158,6 +173,8 @@ def eval_model(args):
+     parser.add_argument("--single-pred-prompt", action="store_true")
+     parser.add_argument("--lang", type=str, default="en")
+     parser.add_argument("--retained_tokens", type=int, default=192)
++    parser.add_argument("--rm-padding", action="store_true",)
++    parser.add_argument("--weight-path", type=str, default=None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_science.py b/llava/eval/model_vqa_science.py
+index c9463a6..ca5479c 100644
+--- a/llava/eval/model_vqa_science.py
++++ b/llava/eval/model_vqa_science.py
+@@ -14,6 +14,7 @@
+ from PIL import Image
+ import math
+ 
++import numpy as np
+ 
+ def split_list(lst, n):
+     """Split a list into n (roughly) equal-sized chunks"""
+@@ -41,6 +42,11 @@ def eval_model(args):
+ 
+     retained_tokens = args.retained_tokens
+ 
++    weights_matrix = None # Default to a matrix of ones
++    if args.weight_path is not None:
++        print(f"Loading weights matrix from {args.weight_path}")
++        weights_matrix = torch.from_numpy(np.load(args.weight_path)).float().to(device='cuda', non_blocking=True)
++
+     for i, line in enumerate(tqdm(questions)):
+         idx = line["id"]
+         question = line['conversations'][0]
+@@ -50,7 +56,15 @@ def eval_model(args):
+         if 'image' in line:
+             image_file = line["image"]
+             image = Image.open(os.path.join(args.image_folder, image_file))
+-            image_tensor = process_images([image], image_processor, model.config)[0]
++            processed_images, processed_masks = process_images([image], image_processor, model.config)
++            image_tensor = processed_images[0]
++            pad_masks = processed_masks[0]
++            weights = weights_matrix
++            if args.rm_padding and pad_masks is not None:
++                if weights_matrix is not None:
++                    weights = weights * pad_masks.to(device='cuda', non_blocking=True)
++                else:
++                    weights = pad_masks.to(device='cuda', non_blocking=True)
+             images = image_tensor.unsqueeze(0).half().cuda()
+             image_sizes = [image.size]
+             if getattr(model.config, 'mm_use_im_start_end', False):
+@@ -61,6 +75,7 @@ def eval_model(args):
+         else:
+             images = None
+             image_sizes = None
++            weights = None
+ 
+         if args.single_pred_prompt:
+             qs = qs + '\n' + "Answer with the option's letter from the given choices directly."
+@@ -74,16 +89,20 @@ def eval_model(args):
+         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+ 
+         with torch.inference_mode():
+-            output_ids = model.generate(
+-                input_ids,
+-                images=images,
+-                image_sizes=image_sizes,
+-                retained_tokens = retained_tokens,
+-                do_sample=True if args.temperature > 0 else False,
+-                temperature=args.temperature,
+-                max_new_tokens=1024,
+-                use_cache=True,
+-            )
++            generate_kwargs = {
++                "images": images,
++                "image_sizes": image_sizes,
++                "retained_tokens": retained_tokens,
++                "do_sample": True if args.temperature > 0 else False,
++                "temperature": args.temperature,
++                "max_new_tokens": 1024,
++                "use_cache": True,
++            }
++            if weights is not None:
++                generate_kwargs["weights"] = weights
++            
++            output_ids = model.generate(input_ids, **generate_kwargs)
++            
+ 
+         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+ 
+@@ -111,6 +130,8 @@ def eval_model(args):
+     parser.add_argument("--answer-prompter", action="store_true")
+     parser.add_argument("--single-pred-prompt", action="store_true")
+     parser.add_argument("--retained_tokens", type=int, default=192)
++    parser.add_argument("--rm-padding", action="store_true",)
++    parser.add_argument("--weight-path", type=str, default=None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/mm_utils.py b/llava/mm_utils.py
+index de97345..3e66f7e 100644
+--- a/llava/mm_utils.py
++++ b/llava/mm_utils.py
+@@ -8,6 +8,7 @@
+ from transformers import StoppingCriteria
+ from llava.constants import IMAGE_TOKEN_INDEX
+ 
++import numpy as np
+ 
+ def select_best_resolution(original_size, possible_resolutions):
+     """
+@@ -152,34 +153,54 @@ def load_image_from_base64(image):
+ def expand2square(pil_img, background_color):
+     width, height = pil_img.size
+     if width == height:
+-        return pil_img
++        mask = Image.new('L', (width, height), 1)
++        return pil_img, mask
+     elif width > height:
+         result = Image.new(pil_img.mode, (width, width), background_color)
+         result.paste(pil_img, (0, (width - height) // 2))
+-        return result
++        mask = Image.new('L', (width, width), 0)
++        mask.paste(Image.new('L', (width, height), 1), (0, (width - height) // 2))
++        return result, mask
+     else:
+         result = Image.new(pil_img.mode, (height, height), background_color)
+         result.paste(pil_img, ((height - width) // 2, 0))
+-        return result
++        mask = Image.new('L', (height, height), 0)
++        mask.paste(Image.new('L', (width, height), 1), ((height - width) // 2, 0))
++        return result, mask
+ 
+ 
+ def process_images(images, image_processor, model_cfg):
+     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
+     new_images = []
++    new_pad_masks = []
++
++    # vision_config = model_cfg.vision_config
++    patch_grid_size = 24
++    num_visual_tokens = patch_grid_size * patch_grid_size
+     if image_aspect_ratio == 'pad':
+         for image in images:
+-            image = expand2square(image, tuple(int(x*255) for x in image_processor.image_mean))
++            image, pad_mask = expand2square(image, tuple(int(x*255) for x in image_processor.image_mean))
+             image = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+             new_images.append(image)
++            resized_mask = pad_mask.resize((patch_grid_size, patch_grid_size), Image.Resampling.BILINEAR)
++            mask_tensor = torch.from_numpy(np.array(resized_mask)).flatten().float()
++            thresholded_mask = (mask_tensor >= 0.5).float()
++            new_pad_masks.append(thresholded_mask)
+     elif image_aspect_ratio == "anyres":
+         for image in images:
+             image = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
+             new_images.append(image)
++            new_pad_masks.append(torch.ones(num_visual_tokens))
+     else:
+-        return image_processor(images, return_tensors='pt')['pixel_values']
++        processed_images = image_processor(images, return_tensors='pt')['pixel_values']
++        batch_size = processed_images.shape[0]
++        placeholder_masks = torch.ones(batch_size, num_visual_tokens)
++        return processed_images, placeholder_masks
+     if all(x.shape == new_images[0].shape for x in new_images):
+         new_images = torch.stack(new_images, dim=0)
+-    return new_images
++    if all(x.shape == new_pad_masks[0].shape for x in new_pad_masks):
++        new_pad_masks = torch.stack(new_pad_masks, dim=0)
++    return new_images, new_pad_masks
+ 
+ 
+ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
+diff --git a/llava/model/language_model/modelling_sparse_llama.py b/llava/model/language_model/modelling_sparse_llama.py
+index 69d6cd9..ed94bf3 100644
+--- a/llava/model/language_model/modelling_sparse_llama.py
++++ b/llava/model/language_model/modelling_sparse_llama.py
+@@ -113,6 +113,7 @@ def forward(
+         token_length_list=[],
+         pre_prompt_length_list = [],
+         retained_tokens = 192,
++        weights: Optional[torch.Tensor] = None,
+     ) -> Union[Tuple, BaseModelOutputWithPast]:
+         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+         output_hidden_states = (
+@@ -213,6 +214,9 @@ def forward(
+             torch.cuda.synchronize()
+             total_start_event.record()
+ 
++        if weights is None and hasattr(self, 'weights'):
++            weights = self.weights
++
+         for layer_idx, decoder_layer in enumerate(self.layers):
+             if (len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1):       
+                 n = hidden_states.shape[1]                                  # token num
+@@ -264,7 +268,7 @@ def forward(
+ 
+                     attn_logits = layer_outputs[2]
+                     
+-                    pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, text_token_start, t_token_idx, layer_idx,retained_tokens) # B, L_v
++                    pred_score_vis, s_flag, relation_vis_text = attn_postprocess_topk(attn_logits, v_token_start, v_token_num, text_token_start, t_token_idx, layer_idx,retained_tokens, weights=weights) # B, L_v
+                     policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+                     policy[:, v_token_start:text_token_start] = pred_score_vis.type(dtype = hidden_states.dtype)
+ 
+diff --git a/llava/model/language_model/score.py b/llava/model/language_model/score.py
+index 3961a91..c0d3d74 100644
+--- a/llava/model/language_model/score.py
++++ b/llava/model/language_model/score.py
+@@ -14,7 +14,7 @@
+     64 : sparse_token_list_64
+ }
+ 
+-def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, text_token_start, t_token_idx, layer_idx,retained_tokens):
++def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, text_token_start, t_token_idx, layer_idx,retained_tokens, weights=None):
+     '''
+     self_attn_weights: [B, H, L, L]
+     '''
+@@ -28,6 +28,12 @@ def attn_postprocess_topk(self_attn_weights, v_token_start, v_token_num, text_to
+     relation_vis = relation_vis_text
+     s_flag = True       # s_flag controls whether token merge is needed.
+ 
++    # ---------------------------------- debias ----------------------------------
++    if layer_idx == 2 and weights is not None:
++        relation_vis = relation_vis * weights
++        print(f"Sum after applying padding mask: {torch.sum(relation_vis).item():.4f}")
++    # ----------------------------------------------------------------------------
++
+     sparse_token_list = sparse_token_dict[retained_tokens]
+ 
+     if v_token_num != 0:
+diff --git a/llava/model/language_model/sparse_llava_llama.py b/llava/model/language_model/sparse_llava_llama.py
+index b5c8bd7..8020777 100644
+--- a/llava/model/language_model/sparse_llava_llama.py
++++ b/llava/model/language_model/sparse_llava_llama.py
+@@ -108,6 +108,7 @@ def generate(
+         inputs: Optional[torch.Tensor] = None,
+         images: Optional[torch.Tensor] = None,
+         image_sizes: Optional[torch.Tensor] = None,
++        weights: Optional[torch.Tensor] = None,
+         retained_tokens = 192,
+         image_shape=576,
+         token_length_list = [],
+@@ -119,6 +120,8 @@ def generate(
+         if "inputs_embeds" in kwargs:
+             raise NotImplementedError("`inputs_embeds` is not supported")
+ 
++        if weights is not None:
++            self.get_model().weights = weights
+         if images is not None:
+             (
+                 inputs,
+@@ -142,6 +145,8 @@ def generate(
+         else:
+             inputs_embeds = self.get_model().embed_tokens(inputs)
+ 
++        if "weights" in kwargs:
++            weights_for_forward = kwargs.pop("weights")
+         return super().generate(
+             position_ids=position_ids,
+             attention_mask=attention_mask,

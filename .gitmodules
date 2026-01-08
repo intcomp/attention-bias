@@ -1,0 +1,15 @@
+[submodule "FastV"]
+	path = FastV
+	url = https://github.com/pkunlp-icler/FastV.git
+[submodule "PyramidDrop"]
+	path = PyramidDrop
+	url = https://github.com/Cooperx521/PyramidDrop.git
+[submodule "SparseVLMs"]
+	path = SparseVLMs
+	url = https://github.com/Gumpest/SparseVLMs.git
+[submodule "TokenCarve"]
+	path = TokenCarve
+	url = https://github.com/ShawnTan86/TokenCarve.git
+[submodule "HiMAP"]
+	path = HiMAP
+	url = https://github.com/ustc-hyin/HiMAP.git

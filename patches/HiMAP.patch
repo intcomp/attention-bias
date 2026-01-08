@@ -1,0 +1,175 @@
+diff --git a/src/HiMAP/inference/eval_scivqa.py b/src/HiMAP/inference/eval_scivqa.py
+index 77b67b6..ddcf15a 100644
+--- a/src/HiMAP/inference/eval_scivqa.py
++++ b/src/HiMAP/inference/eval_scivqa.py
+@@ -41,6 +41,13 @@ if __name__ == "__main__":
+     parser.add_argument('--hmap-v-attn-img-layer', type=int, required=False, help='the layer of pruning accorading to img2img information')
+     parser.add_argument('--hmap-v-attn-txt-rank', type=int, required=False, help='the rank of attn accorading to img2txt information')
+     parser.add_argument('--hmap-v-attn-img-rank', type=int, required=False, help='the rank of attn accorading to img2img information')
++    
++    # add weight fit
++    parser.add_argument("--tag", type=str, default="before")
++    parser.add_argument('--task', type=str, default="vqa", help='eval task')
++    parser.add_argument('--attention-score-file', type=str, default="")
++    parser.add_argument('--attention-frequency-file', type=str, default="")
++    parser.add_argument("--weight-file", type=str, default=None)
+     args = parser.parse_args()
+ 
+     # Model
+@@ -65,10 +72,18 @@ if __name__ == "__main__":
+         print('NO TOKEN PRUNING TCHNIQUE WILL BE USED ------')
+ 
+     model.model.reset_hmapv()
+-
++    if args.use_hmap_v == True:
++        task = args.task       
++        model.model.set_attention_score_frequency_file(args.attention_score_file, args.attention_frequency_file, args.tag, args.weight_file)
++        
++        print("args.tag:", args.tag)
++        print("args.weight_file:", args.weight_file)
++        print("attention_score_file:", args.attention_score_file)
++        print("attention_frequency_file:", args.attention_frequency_file)
++        
+     questions = json.load(open(os.path.expanduser(args.question_file), "r"))
++    questions = [q for q in questions if "image" in q]
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+-
+     num_sample = len(questions)
+     corr_sample = 0
+ 
+@@ -89,7 +104,8 @@ if __name__ == "__main__":
+         else:
+             qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+         cur_prompt = '<image>' + '\n' + cur_prompt
+-
++        if args.tag != "paper":
++            model.model._cached_image_size = image.size
+ 
+         if args.single_pred_prompt:
+             qs = qs + '\n' + "Answer with the option's letter from the given choices directly."
+@@ -117,7 +133,12 @@ if __name__ == "__main__":
+                 output_scores=True,
+                 return_dict_in_generate=True,
+             )
+-
++        if args.use_hmap_v == True:
++            with open(args.attention_score_file, "a") as f:
++                f.write("\n")
++            with open(args.attention_frequency_file, "a") as f:
++                f.write("\n")
++            
+         input_token_len = input_ids.shape[1]
+         n_diff_input_output = (input_ids != output_ids['sequences'][:, :input_token_len]).sum().item()
+         if n_diff_input_output > 0:
+diff --git a/src/LLaVA/llava/model/language_model/himap.py b/src/LLaVA/llava/model/language_model/himap.py
+index bb06d4c..86bc1dd 100644
+--- a/src/LLaVA/llava/model/language_model/himap.py
++++ b/src/LLaVA/llava/model/language_model/himap.py
+@@ -5,9 +5,63 @@ from .himap_modeling_llama import LlamaModel
+ from .himap_configuration_llama import LlamaConfig
+ from transformers.modeling_outputs import BaseModelOutputWithPast
+ from typing import List, Optional, Tuple, Union
++import numpy as np
+ 
+ logger = logging.get_logger(__name__)
+ 
++def generate_pad_mask(width, height, grid_size=24, img_size=336, threshold=0.3):
++    """
++    Generates a padding mask of shape (grid_size, grid_size).
++
++    This function calculates the padding ratio for each patch in the grid.
++    If the padding ratio of a patch exceeds the threshold, the mask value is set to 0 
++    (indicating a padded/invalid region); otherwise, it is set to 1.
++
++    Args:
++        width (int): The original width of the image.
++        height (int): The original height of the image.
++        grid_size (int, optional): The number of patches per row/column. Defaults to 24.
++        img_size (int, optional): The target size of the resized image. Defaults to 336.
++        threshold (float, optional): The threshold for padding ratio. Defaults to 0.3.
++
++    Returns:
++        np.ndarray: A mask of shape (grid_size, grid_size) with integer type.
++    """
++    patch_size = img_size // grid_size
++    mask = np.zeros((grid_size, grid_size), dtype=int)
++
++    if width < height:
++        pad = (height - width) / (2 * height) * img_size
++        left, right = pad, img_size - pad
++        top, bottom = 0, img_size
++    elif height < width:
++        pad = (width - height) / (2 * width) * img_size
++        top, bottom = pad, img_size - pad
++        left, right = 0, img_size
++    else:
++        left, right, top, bottom = 0, img_size, 0, img_size
++
++    for i in range(grid_size):
++        for j in range(grid_size):
++            x0, x1 = j * patch_size, (j + 1) * patch_size
++            y0, y1 = i * patch_size, (i + 1) * patch_size
++
++            inter_left = max(x0, left)
++            inter_right = min(x1, right)
++            inter_top = max(y0, top)
++            inter_bottom = min(y1, bottom)
++
++            inter_w = max(0, inter_right - inter_left)
++            inter_h = max(0, inter_bottom - inter_top)
++            inter_area = inter_w * inter_h
++
++            patch_area = patch_size * patch_size
++            pad_ratio = 1 - inter_area / patch_area
++
++            mask[i, j] = 0 if pad_ratio > threshold else 1
++
++    return mask
++
+ class Himap_LlamaModel(LlamaModel):
+ 
+     def __init__(self, config: LlamaConfig):
+@@ -32,6 +86,16 @@ class Himap_LlamaModel(LlamaModel):
+         self.hmap_v_attn_img_rank = self.config.hmap_v_attn_img_rank
+         self.use_hmap_v = self.config.use_hmap_v  
+ 
++    def set_attention_score_frequency_file(self, tag, weight_file):
++        self.tag = tag
++        self.weight_file = weight_file
++        if self.tag == "after":
++            spline_weight = np.load(self.weight_file)
++            self.register_buffer(
++                "attention_avg_weight",
++                torch.from_numpy(spline_weight).to(dtype=torch.float16)  # 不要每次 to()
++            )
++        
+     def forward(
+         self,
+         input_ids: torch.LongTensor = None,
+@@ -155,8 +219,24 @@ class Himap_LlamaModel(LlamaModel):
+                         img2txt_attn = torch.sum(
+                             txt_layer_attn_avg[SYS_LENGTH+IMG_LENGTH:, SYS_LENGTH:SYS_LENGTH+IMG_LENGTH], dim=0
+                         )
+-                        # get the indexs of selected image tokens
+-                        img2txt_attn_topk_index = img2txt_attn.topk(TXT_ATTN_RANK).indices + SYS_LENGTH
++                        if self.tag == "after":
++                            if hasattr(self, "_cached_image_size"):
++                                image_w, image_h = self._cached_image_size
++                                attention_score_pad_mask = torch.tensor(generate_pad_mask(image_w, image_h, threshold=0.5)).to(dtype=img2txt_attn.dtype, device=img2txt_attn.device)
++                                img2txt_attn = img2txt_attn * attention_score_pad_mask.reshape(-1)
++                            ############################ method weight2 ############################                                
++                            img2txt_attn = self.attention_avg_weight.to(img2txt_attn.device) * img2txt_attn
++                            img2txt_attn_topk_index = img2txt_attn.topk(TXT_ATTN_RANK).indices + SYS_LENGTH
++                            ############################ method weight2 ############################
++                            
++                        else:
++                            if hasattr(self, "_cached_image_size"):
++                                image_w, image_h = self._cached_image_size
++                                attention_score_pad_mask = torch.tensor(generate_pad_mask(image_w, image_h, threshold=0.5)).to(dtype=img2txt_attn.dtype, device=img2txt_attn.device)
++                                img2txt_attn = img2txt_attn * attention_score_pad_mask.reshape(-1)
++                            # get the indexs of selected image tokens
++                            img2txt_attn_topk_index = img2txt_attn.topk(TXT_ATTN_RANK).indices + SYS_LENGTH
++                                
+                         txt_keep_indexs = torch.cat(
+                             (
+                                 torch.arange(SYS_LENGTH, device=device),

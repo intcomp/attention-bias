@@ -1,0 +1,191 @@
+diff --git a/TokenCarve/TokenCarve_model_vqa_loader.py b/TokenCarve/TokenCarve_model_vqa_loader.py
+index 280e0cb..62a6647 100644
+--- a/TokenCarve/TokenCarve_model_vqa_loader.py
++++ b/TokenCarve/TokenCarve_model_vqa_loader.py
+@@ -55,7 +55,6 @@ class CustomDataset(Dataset):
+         image_tensor = process_images([image], self.image_processor, self.model_config)[0]
+ 
+         input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+-
+         return input_ids, image_tensor, image.size
+ 
+     def __len__(self):
+@@ -83,6 +82,7 @@ def eval_model(args):
+     model_path = os.path.expanduser(args.model_path)
+     model_name = get_model_name_from_path(model_path)
+     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
++    
+     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+     answers_file = os.path.expanduser(args.answers_file)
+@@ -110,7 +110,21 @@ def eval_model(args):
+     model.model.reset_token_carve_parameter()
+     ################# token_carve parameter ending
+     
++    ################# weight_fit parameter start
++    tag = args.tag
++    weight = args.weight_file
++    
++    model.model.define_attention_map(tag, weight)
++    
++    print("####################### related information ####################### ")
++    print("TAG:", tag)
++    print("token_carve_image_token_rank=", int(args.token_carve_image_token_nums / 2 * 3))
++    print("token_carve_merge_token_nums=", int(args.token_carve_image_token_nums / 2))
++    print("token_carve_work_layer=", args.token_carve_work_layer)
++    print("weight_file:", weight)
+     print('model.config.token_carve_sys_length: {}'.format(model.config.token_carve_sys_length))
++    ################# weight_fit parameter ending
++    
+     current_model = model
+     while hasattr(current_model, "LlamaModel"):
+         current_model = current_model.base_model
+@@ -119,7 +133,8 @@ def eval_model(args):
+     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
+         idx = line["question_id"]
+         cur_prompt = line["text"]
+-
++        if tag !="paper":
++            model.model._cached_image_size = image_sizes[0]
+         input_ids = input_ids.to(device='cuda', non_blocking=True)
+ 
+         with torch.inference_mode():
+@@ -148,11 +163,11 @@ def eval_model(args):
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--model-path", type=str, default="./llava7b")
++    parser.add_argument("--model-path", type=str, default="/media/estar/Data/ywb-2/VisPruner-main/checkpoint/llava-v1.5-7b")
+     parser.add_argument("--model-base", type=str, default=None)
+-    parser.add_argument("--image-folder", type=str, default="./playground/data/eval/textvqa/train_images")
++    parser.add_argument("--image-folder", type=str, default="/media/estar/Data/ywb-2/FastV-main/playground/data/eval/textvqa/train_images")
+     parser.add_argument("--question-file", type=str, default="./playground/data/eval/textvqa/llava_textvqa_val_v051_ocr.jsonl")
+-    parser.add_argument("--answers-file", type=str, default="./TokenCarve_llava-v1.5-7b.jsonl")
++    parser.add_argument("--answers-file", type=str, default="./playground/data/eval/textvqa/answers/TokenCarve_llava-v1.5-7b-debug.jsonl")
+     parser.add_argument("--conv-mode", type=str, default="vicuna_v1")
+     parser.add_argument("--num-chunks", type=int, default=1)
+     parser.add_argument("--chunk-idx", type=int, default=0)
+@@ -162,7 +177,7 @@ if __name__ == "__main__":
+     parser.add_argument("--max_new_tokens", type=int, default=128)
+ 
+     ################# token_carve parameter start
+-    parser.add_argument("--use-token-carve", default=False, action='store_true') # use TokenCarve
++    parser.add_argument("--use-token-carve", default=True) # use TokenCarve
+     parser.add_argument('--token-carve-sys-length', type=int, default=36)
+     parser.add_argument('--token-carve-image-token-length', type=int, default=576)
+     parser.add_argument('--token-carve-work-layer', type=int, default=2)
+@@ -170,6 +185,11 @@ if __name__ == "__main__":
+     parser.add_argument('--token-carve-SV-AV-mode', type=int, default=0)    # 0:TokenCarve mode, 1:SV mode, 2: AV mode  
+     parser.add_argument('--token-carve-SV-AV-weight', type=float, default=0.5) # Weight of SV to AV
+     ################# token_carve parameter ending
++    
++    ################# weight_fit parameter start
++    parser.add_argument('--tag', type=str, default="before", help='traing before or after balanced')
++    parser.add_argument('--weight-file', type=str, default=None)
++    ################# weight_fit parameter ending    
+ 
+     args = parser.parse_args()
+     print(args)
+diff --git a/TokenCarve/modeling_llama.py b/TokenCarve/modeling_llama.py
+index 28b371f..fd2e78d 100644
+--- a/TokenCarve/modeling_llama.py
++++ b/TokenCarve/modeling_llama.py
+@@ -66,6 +66,59 @@ logger = logging.get_logger(__name__)
+ 
+ _CONFIG_FOR_DOC = "LlamaConfig"
+ 
++def generate_pad_mask(width, height, grid_size=24, img_size=336, threshold=0.3):
++    """
++    Generates a padding mask of shape (grid_size, grid_size).
++
++    This function calculates the padding ratio for each patch in the grid.
++    If the padding ratio of a patch exceeds the threshold, the mask value is set to 0 
++    (indicating a padded/invalid region); otherwise, it is set to 1.
++
++    Args:
++        width (int): The original width of the image.
++        height (int): The original height of the image.
++        grid_size (int, optional): The number of patches per row/column. Defaults to 24.
++        img_size (int, optional): The target size of the resized image. Defaults to 336.
++        threshold (float, optional): The threshold for padding ratio. Defaults to 0.3.
++
++    Returns:
++        np.ndarray: A mask of shape (grid_size, grid_size) with integer type.
++    """
++    import numpy as np
++    patch_size = img_size // grid_size
++    mask = np.zeros((grid_size, grid_size), dtype=int)
++
++    if width < height:
++        pad = (height - width) / (2 * height) * img_size
++        left, right = pad, img_size - pad
++        top, bottom = 0, img_size
++    elif height < width:
++        pad = (width - height) / (2 * width) * img_size
++        top, bottom = pad, img_size - pad
++        left, right = 0, img_size
++    else:
++        left, right, top, bottom = 0, img_size, 0, img_size
++
++    for i in range(grid_size):
++        for j in range(grid_size):
++            x0, x1 = j * patch_size, (j + 1) * patch_size
++            y0, y1 = i * patch_size, (i + 1) * patch_size
++
++            inter_left = max(x0, left)
++            inter_right = min(x1, right)
++            inter_top = max(y0, top)
++            inter_bottom = min(y1, bottom)
++
++            inter_w = max(0, inter_right - inter_left)
++            inter_h = max(0, inter_bottom - inter_top)
++            inter_area = inter_w * inter_h
++
++            patch_area = patch_size * patch_size
++            pad_ratio = 1 - inter_area / patch_area
++
++            mask[i, j] = 0 if pad_ratio > threshold else 1
++
++    return mask
+ 
+ def _get_unpad_data(attention_mask):
+     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+@@ -1006,6 +1059,12 @@ class LlamaModel(LlamaPreTrainedModel):
+         self.token_carve_SV_AV_weight = self.config.token_carve_SV_AV_weight
+     ################# token_carve parameter ending
+ 
++    ################# weight_fit parameter start
++    def define_attention_map(self, tag, weight):
++        self.tag = tag
++        self.weight = weight
++    ################# weight_fit parameter ending
++
+     def get_input_embeddings(self):
+         return self.embed_tokens
+ 
+@@ -1154,6 +1213,25 @@ class LlamaModel(LlamaPreTrainedModel):
+                             last_layer_attention_avg_last_tok = last_layer_attention_avg[-1]
+                             last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok[
+                                                                       Token_carve_sys_length:Token_carve_sys_length + Token_carve_image_token_length]
++                            ############################ unpad ############################
++                            if hasattr(self, "_cached_image_size"):
++                                image_w, image_h = self._cached_image_size
++                                attention_score_pad_mask = torch.tensor(
++                                    generate_pad_mask(image_w, image_h, threshold=0.5)
++                                ).to(
++                                    dtype=last_layer_attention_avg_last_tok_image.dtype, 
++                                    device=last_layer_attention_avg_last_tok_image.device
++                                )
++                                last_layer_attention_avg_last_tok_image = last_layer_attention_avg_last_tok_image * attention_score_pad_mask.reshape(-1)
++                            ############################ unpad ############################
++                            ############################ weight fit ############################
++                            if self.tag == "after":
++                                import numpy as np
++                                spline_weight = np.load(self.weight)
++                                last_layer_attention_avg_weight = torch.from_numpy(spline_weight).to(dtype=last_layer_attention_avg_last_tok_image.dtype, device=last_layer_attention_avg_last_tok_image.device)
++                                # last_layer_attention_avg_weight[-1] = 0
++                                last_layer_attention_avg_last_tok_image = last_layer_attention_avg_weight * last_layer_attention_avg_last_tok_image
++                            ############################ weight fit ############################
+                             Token_carve_AV_top_attention_rank_index = last_layer_attention_avg_last_tok_image.topk(
+                                 Token_carve_image_token_rank).indices + Token_carve_sys_length  ## Token_carve_SVD_AS
+                             _, AV_top_attention_rank_index = torch.sort(last_layer_attention_avg_last_tok_image,

@@ -1,0 +1,299 @@
+diff --git a/llava/eval/model_vqa.py b/llava/eval/model_vqa.py
+index 9387064..6671976 100644
+--- a/llava/eval/model_vqa.py
++++ b/llava/eval/model_vqa.py
+@@ -31,8 +31,28 @@ def eval_model(args):
+     disable_torch_init()
+     model_path = os.path.expanduser(args.model_path)
+     model_name = get_model_name_from_path(model_path)
+-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+-
++    if args.layer_list is not None:
++        pdrop_infer = True  # whether to use pdrop infer
++    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, 
++                                                                           args.model_base, 
++                                                                           model_name,
++                                                                           pdrop_infer)
++
++    model_class_name = type(model).__name__
++    if model_class_name == "LlavaLlamaForCausalLM_PDrop":
++        model.model.layer_list = eval(args.layer_list)
++        model.model.image_token_ratio_list = eval(args.image_token_ratio_list)
++        model.model.image_token_ratio_list.insert(0, 1.0)
++
++        Ks = str(args.layer_list)
++        rank = str(args.image_token_ratio_list)
++        
++        model.model.set_attention_score_frequency_file(args.tag, args.weight_file)
++        
++        print("args.tag:", args.tag)
++        print("args.weight_file:", args.weight_file)
++        print("weight_file:", args.weight_file)
++        
+     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+     answers_file = os.path.expanduser(args.answers_file)
+@@ -57,6 +77,8 @@ def eval_model(args):
+ 
+         image = Image.open(os.path.join(args.image_folder, image_file)).convert('RGB')
+         image_tensor = process_images([image], image_processor, model.config)[0]
++        if args.tag != "paper":
++            model.model._cached_image_size = image.size
+ 
+         with torch.inference_mode():
+             output_ids = model.generate(
+@@ -96,6 +118,14 @@ if __name__ == "__main__":
+     parser.add_argument("--temperature", type=float, default=0.2)
+     parser.add_argument("--top_p", type=float, default=None)
+     parser.add_argument("--num_beams", type=int, default=1)
++    parser.add_argument("--layer_list", type=str, default= None)
++    parser.add_argument("--image_token_ratio_list", type=str, default= None)
++    parser.add_argument("--pdrop_infer", action='store_true', help="use this to apply pdrop inference to ori llava-1.5")
++    
++    # add weight fit
++    parser.add_argument("--tag", type=str, default= "before")
++    parser.add_argument("--weight-file", type=str, default= None)
++    
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_loader.py b/llava/eval/model_vqa_loader.py
+index a1a159f..2c17ddd 100644
+--- a/llava/eval/model_vqa_loader.py
++++ b/llava/eval/model_vqa_loader.py
+@@ -95,6 +95,15 @@ def eval_model(args):
+         model.model.image_token_ratio_list = eval(args.image_token_ratio_list)
+         model.model.image_token_ratio_list.insert(0, 1.0)
+ 
++        Ks = str(args.layer_list)
++        rank = str(args.image_token_ratio_list)
++        
++        model.model.set_attention_score_frequency_file(args.tag, args.weight_file)
++        
++        print("args.tag:", args.tag)
++        print("args.weight_file:", args.weight_file)
++        print("weight_file:", args.weight_file)
++   
+     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+     answers_file = os.path.expanduser(args.answers_file)
+@@ -112,6 +121,8 @@ def eval_model(args):
+         cur_prompt = line["text"]
+ 
+         input_ids = input_ids.to(device='cuda', non_blocking=True)
++        if args.tag != "paper":
++            model.model._cached_image_size = image_sizes[0]
+ 
+         with torch.inference_mode():
+             output_ids = model.generate(
+@@ -154,6 +165,10 @@ if __name__ == "__main__":
+     parser.add_argument("--layer_list", type=str, default= None)
+     parser.add_argument("--image_token_ratio_list", type=str, default= None)
+     parser.add_argument("--pdrop_infer", action='store_true', help="use this to apply pdrop inference to ori llava-1.5")
++    
++    # add weight fit
++    parser.add_argument("--tag", type=str, default= "before")
++    parser.add_argument("--weight-file", type=str, default= None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_mmbench.py b/llava/eval/model_vqa_mmbench.py
+index e4ff5de..57a5062 100644
+--- a/llava/eval/model_vqa_mmbench.py
++++ b/llava/eval/model_vqa_mmbench.py
+@@ -70,6 +70,12 @@ def eval_model(args):
+         model.model.image_token_ratio_list = eval(args.image_token_ratio_list)
+         model.model.image_token_ratio_list.insert(0, 1.0)
+ 
++        model.model.set_attention_score_frequency_file(args.tag, args.weight_file)
++        
++        print("args.tag:", args.tag)
++        print("args.weight_file:", args.weight_file)
++        print("weight_file:", args.weight_file)
++        
+     questions = pd.read_table(os.path.expanduser(args.question_file))
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+     answers_file = os.path.expanduser(args.answers_file)
+@@ -118,6 +124,8 @@ def eval_model(args):
+             input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+ 
+             image_tensor = process_images([image], image_processor, model.config)[0]
++            if args.tag != "paper":
++                model.model._cached_image_size = image.size
+ 
+             with torch.inference_mode():
+                 output_ids = model.generate(
+@@ -170,6 +178,11 @@ if __name__ == "__main__":
+     parser.add_argument("--layer_list", type=str, default= None)
+     parser.add_argument("--image_token_ratio_list", type=str, default= None)
+     parser.add_argument("--pdrop_infer", action='store_true', help="use this to apply pdrop inference to ori llava-1.5")
++    
++    # add weight fit
++    parser.add_argument("--tag", type=str, default= "before")
++    parser.add_argument("--weight-file", type=str, default= None)
++    
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/eval/model_vqa_science.py b/llava/eval/model_vqa_science.py
+index 24c238e..6006e11 100644
+--- a/llava/eval/model_vqa_science.py
++++ b/llava/eval/model_vqa_science.py
+@@ -45,8 +45,19 @@ def eval_model(args):
+         model.model.image_token_ratio_list = eval(args.image_token_ratio_list)
+         model.model.image_token_ratio_list.insert(0, 1.0)
+ 
++        Ks = str(args.layer_list)
++        rank = str(args.image_token_ratio_list)
++        
++        model.model.set_attention_score_frequency_file(args.tag, args.weight_file)
++        
++        print("args.tag:", args.tag)
++        print("args.weight_file:", args.weight_file)
++        print("weight_file:", args.weight_file)
++
+     questions = json.load(open(os.path.expanduser(args.question_file), "r"))
++
+     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
++    questions = [q for q in questions if "image" in q]
+     answers_file = os.path.expanduser(args.answers_file)
+     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+     ans_file = open(answers_file, "w")
+@@ -67,6 +78,8 @@ def eval_model(args):
+             else:
+                 qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+             cur_prompt = '<image>' + '\n' + cur_prompt
++            if args.tag != "paper":
++                model.model._cached_image_size = image.size
+         else:
+             images = None
+             image_sizes = None
+@@ -120,6 +133,10 @@ if __name__ == "__main__":
+     parser.add_argument("--single-pred-prompt", action="store_true")
+     parser.add_argument("--layer_list", type=str, default= None)
+     parser.add_argument("--image_token_ratio_list", type=str, default= None)
++    
++    # add weight fit
++    parser.add_argument("--tag", type=str, default= "before")
++    parser.add_argument("--weight-file", type=str, default= None)
+     args = parser.parse_args()
+ 
+     eval_model(args)
+diff --git a/llava/model/modeling_llama_pdrop.py b/llava/model/modeling_llama_pdrop.py
+index 7527c73..d76e049 100644
+--- a/llava/model/modeling_llama_pdrop.py
++++ b/llava/model/modeling_llama_pdrop.py
+@@ -56,6 +56,7 @@ if is_flash_attn_2_available():
+     from flash_attn import flash_attn_func, flash_attn_varlen_func
+     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+ 
++import numpy as np
+ 
+ # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
+ # It means that the function will not be traced through and simply appear as a node in the graph.
+@@ -70,6 +71,58 @@ logger = logging.get_logger(__name__)
+ 
+ _CONFIG_FOR_DOC = "LlamaConfig"
+ 
++def generate_pad_mask(width, height, grid_size=24, img_size=336, threshold=0.3):
++    """
++    Generates a padding mask of shape (grid_size, grid_size).
++
++    This function calculates the padding ratio for each patch in the grid.
++    If the padding ratio of a patch exceeds the threshold, the mask value is set to 0 
++    (indicating a padded/invalid region); otherwise, it is set to 1.
++
++    Args:
++        width (int): The original width of the image.
++        height (int): The original height of the image.
++        grid_size (int, optional): The number of patches per row/column. Defaults to 24.
++        img_size (int, optional): The target size of the resized image. Defaults to 336.
++        threshold (float, optional): The threshold for padding ratio. Defaults to 0.3.
++
++    Returns:
++        np.ndarray: A mask of shape (grid_size, grid_size) with integer type.
++    """
++    patch_size = img_size // grid_size
++    mask = np.zeros((grid_size, grid_size), dtype=int)
++
++    if width < height:
++        pad = (height - width) / (2 * height) * img_size
++        left, right = pad, img_size - pad
++        top, bottom = 0, img_size
++    elif height < width:
++        pad = (width - height) / (2 * width) * img_size
++        top, bottom = pad, img_size - pad
++        left, right = 0, img_size
++    else:
++        left, right, top, bottom = 0, img_size, 0, img_size
++
++    for i in range(grid_size):
++        for j in range(grid_size):
++            x0, x1 = j * patch_size, (j + 1) * patch_size
++            y0, y1 = i * patch_size, (i + 1) * patch_size
++
++            inter_left = max(x0, left)
++            inter_right = min(x1, right)
++            inter_top = max(y0, top)
++            inter_bottom = min(y1, bottom)
++
++            inter_w = max(0, inter_right - inter_left)
++            inter_h = max(0, inter_bottom - inter_top)
++            inter_area = inter_w * inter_h
++
++            patch_area = patch_size * patch_size
++            pad_ratio = 1 - inter_area / patch_area
++
++            mask[i, j] = 0 if pad_ratio > threshold else 1
++
++    return mask
+ 
+ def _get_unpad_data(attention_mask):
+     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+@@ -972,6 +1025,16 @@ class LlamaModel(LlamaPreTrainedModel):
+     def set_input_embeddings(self, value):
+         self.embed_tokens = value
+ 
++    def set_attention_score_frequency_file(self, tag, weight_file):
++        self.tag = tag
++        self.weight_file = weight_file
++        if self.tag == "after":
++            spline_weight = np.load(self.weight_file)
++            self.register_buffer(
++                "attention_avg_weight",
++                torch.from_numpy(spline_weight)  # 不要每次 to()
++            )
++            
+     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+     def forward(
+         self,
+@@ -1399,13 +1462,23 @@ class LlamaModel(LlamaPreTrainedModel):
+                 attention_avg_head = torch.mean(attn_weights, dim=0) # ave across heads
+                 attention_avg_head = attention_avg_head[:,image_index:image_index+image_tokens[i]] # select image token as keys
+                 attention_avg_text = torch.mean(attention_avg_head, dim=0) # (576)
+-
++                if cur_num == 0:
++                    if hasattr(self, "_cached_image_size"):
++                        image_w, image_h = self._cached_image_size
++                        attention_score_pad_mask = torch.tensor(generate_pad_mask(image_w, image_h, threshold=0.01)).to(dtype=attention_avg_text.dtype, device=attention_avg_text.device)
++                        attention_avg_text = attention_avg_text * attention_score_pad_mask.reshape(-1)
+                 
+-                # rank and drop by attention score
+-                top_rank_index = attention_avg_text.topk(keep_length[i]).indices
+-                top_rank_index = top_rank_index + image_index  
+-                top_rank_index= top_rank_index.sort().values  
+-
++                if self.tag == "after" and cur_num==0:
++                    attention_avg_text_mul_weight = self.attention_avg_weight.to(dtype=attention_avg_text.dtype, device=attention_avg_text.device) * attention_avg_text
++                    top_rank_index = attention_avg_text_mul_weight.topk(keep_length[i]).indices
++                    top_rank_index = top_rank_index + image_index  
++                    top_rank_index= top_rank_index.sort().values  
++                else:
++                    # rank and drop by attention score
++                    top_rank_index = attention_avg_text.topk(keep_length[i]).indices
++                    top_rank_index = top_rank_index + image_index  
++                    top_rank_index= top_rank_index.sort().values  
++                    
+                 start_index = image_index + image_tokens[i]
+                 new_input_embeds = torch.cat([features[i][ :image_index, :] ,features[i][ top_rank_index, :], features[i][start_index:, :]], dim=0)
+                 new_labels = torch.cat([labels[i][ :image_index],labels[i][ top_rank_index], labels[i][start_index:]], dim=0)
